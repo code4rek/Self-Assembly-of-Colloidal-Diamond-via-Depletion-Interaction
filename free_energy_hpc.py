@@ -6,6 +6,12 @@ Hamiltonian:
 
     U_s = s U_real + (1-s) lambda_max U_E
 
+The physical brush + depletion potential is unchanged outside an extremely
+small contact regularization region. At and below contact, the tabulated
+potential is continued with a linear repulsive branch. This prevents
+hoomd.md.pair.Table from assigning zero energy and zero force to overlapping
+pairs below r_min.
+
 At every TLPP, U_E tethers the core center and all four lobes to their own
 reference positions. The four equivalent lobe tethers give tetrahedrally
 symmetric small-angle rotational stiffness.
@@ -23,7 +29,6 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-
 import gsd.hoomd
 import hoomd
 import numpy as np
@@ -36,12 +41,12 @@ from scipy.spatial.transform import Rotation
 KT = 1.0
 PHI = 0.05
 SIGMAP = 0.02
-RDEP = 0.5 * SIGMAP
+RDEP = 0.5*SIGMAP
 L_BRUSH = 0.01
-SIGMAG = 0.09 * (1000) ** 2
+SIGMAG = 0.09*(1000)**2
 
 # The Python file owns the output location and creates it when needed.
-OUT_DIR = Path("/scratch/agg7742/hoomd-results/free_energy")
+OUT_DIR = Path("/scratch/agg7742/free_energy")
 
 # All three periodic cells contain exactly 144 TLPPs.
 # diamond: 4 basis sites * 3 * 4 * 3 = 144
@@ -51,14 +56,25 @@ DIAMOND_DIMS = (3, 4, 3)
 MTAB_DIMS = (3, 4, 3)
 RHOMBO_DIMS = (4, 4, 9)
 
-DT = 1e-4
-EQUIL_STEPS = 100_000
-PRODUCTION_STEPS = 1_000_000
-WRITE_EVERY = 10_000
-SAMPLE_EVERY = 10_000
-N_TABLE = 1000
+DT = 1e-5
+EQUIL_STEPS = 1000_000
+TARGET_FINAL_TIMESTEP = 500_000_000
+WRITE_EVERY = 100_000
+SAMPLE_EVERY = 100_000
 USE_GPU = False
 FIX_REFERENCE_TLPP = True
+
+# Contact-table regularization. The original table began exactly at contact,
+# where P_Implicit_Dep returned zero, and HOOMD also sets U=F=0 below r_min.
+# The new table extends almost to zero center-to-center separation and joins
+# the original potential at a small positive surface gap with a continuous,
+# constant-force repulsive branch. The original potential is unchanged for
+# x >= CONTACT_SWITCH_GAP.
+CONTACT_SWITCH_GAP = 4.0e-5
+CONTACT_DERIVATIVE_STEP = 4.0e-5
+TABLE_R_MIN = 0.0001
+TABLE_TARGET_BIN_WIDTH = 4.0e-5
+POTENTIAL_VERSION = "contact_regularized_extended_table_v3"
 
 # Translate the complete periodic crystal before rigid bodies and reference
 # sites are created. This only changes where the periodic box cuts the crystal.
@@ -122,14 +138,100 @@ def P_Implicit_Dep(r1, r2, sigma_g, L, phi, rdep, rcc):
     return U_B + U_AO
 
 
+def P_Implicit_Dep_contact_regularized(
+    r1,
+    r2,
+    sigma_g,
+    L,
+    phi,
+    rdep,
+    rcc,
+):
+    """Return the physical potential with a repulsive contact continuation.
+
+    For surface gaps x >= CONTACT_SWITCH_GAP, this returns the original
+    P_Implicit_Dep potential exactly.
+
+    For x < CONTACT_SWITCH_GAP, it uses the tangent estimated immediately to
+    the right of CONTACT_SWITCH_GAP and continues that repulsive branch
+    linearly. Thus, U and F remain finite, continuous, and repulsive through
+    contact and into the overlap region sampled by the Einstein endpoint.
+    """
+    contact_distance = r1 + r2
+    x = rcc - contact_distance
+
+    if x >= CONTACT_SWITCH_GAP:
+        return P_Implicit_Dep(
+            r1,
+            r2,
+            sigma_g,
+            L,
+            phi,
+            rdep,
+            rcc,
+        )
+
+    r_switch = contact_distance + CONTACT_SWITCH_GAP
+    r_next = r_switch + CONTACT_DERIVATIVE_STEP
+
+    U_switch = P_Implicit_Dep(
+        r1,
+        r2,
+        sigma_g,
+        L,
+        phi,
+        rdep,
+        r_switch,
+    )
+    U_next = P_Implicit_Dep(
+        r1,
+        r2,
+        sigma_g,
+        L,
+        phi,
+        rdep,
+        r_next,
+    )
+
+    F_switch = -(
+        U_next - U_switch
+    ) / CONTACT_DERIVATIVE_STEP
+
+    if not np.isfinite(F_switch) or F_switch <= 0.0:
+        raise RuntimeError(
+            "Contact continuation did not produce a finite repulsive force: "
+            f"F_switch={F_switch}."
+        )
+
+    return U_switch + F_switch * (
+        CONTACT_SWITCH_GAP - x
+    )
+
+
 def tabulate_P_implicit(
     r1, r2, sigma_g, L, phi, rdep, r_min, r_max, n_points=1000
 ):
-    r = np.linspace(r_min, r_max, n_points)
+    # HOOMD's implicit table grid is equivalent to endpoint=False.
+    r = np.linspace(r_min, r_max, n_points, endpoint=False)
     U = np.array(
-        [P_Implicit_Dep(r1, r2, sigma_g, L, phi, rdep, ri) for ri in r]
+        [
+            P_Implicit_Dep_contact_regularized(
+                r1,
+                r2,
+                sigma_g,
+                L,
+                phi,
+                rdep,
+                ri,
+            )
+            for ri in r
+        ]
     )
     F = -np.gradient(U, r)
+
+    if not np.all(np.isfinite(U)) or not np.all(np.isfinite(F)):
+        raise RuntimeError("Non-finite value in the regularized pair table.")
+
     return U, F
 
 
@@ -473,29 +575,102 @@ class CoreFourLobeTether(hoomd.md.force.Custom):
 class EnergyRecorder(hoomd.custom.Action):
     """Record both scaled force energies and the reconstructed g(s)."""
 
-    def __init__(self, table, tether, s_value, n_cores, csv_path):
+    FIELDNAMES = [
+        "timestep",
+        "scaled_pair_energy",
+        "scaled_tether_energy",
+        "U_real",
+        "lambda_max_U_E",
+        "g_total",
+        "g_per_tlpp",
+    ]
+
+    def __init__(
+        self,
+        table,
+        tether,
+        s_value,
+        n_cores,
+        csv_path,
+        append=False,
+        checkpoint_timestep=None,
+    ):
         self.table = table
         self.tether = tether
         self.s_value = float(s_value)
         self.n_cores = int(n_cores)
         self.csv_path = Path(csv_path)
         self.g_per_tlpp = []
+        self.last_recorded_timestep = -1
 
-        with self.csv_path.open("w", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(
-                [
-                    "timestep",
-                    "scaled_pair_energy",
-                    "scaled_tether_energy",
-                    "U_real",
-                    "lambda_max_U_E",
-                    "g_total",
-                    "g_per_tlpp",
-                ]
-            )
+        if append:
+            if checkpoint_timestep is None:
+                raise ValueError(
+                    "checkpoint_timestep is required when appending energies."
+                )
+            self._prepare_existing_csv(int(checkpoint_timestep))
+        else:
+            with self.csv_path.open("w", newline="") as stream:
+                csv.DictWriter(
+                    stream,
+                    fieldnames=self.FIELDNAMES,
+                ).writeheader()
+
+    def _prepare_existing_csv(self, checkpoint_timestep):
+        """Keep valid rows through the GSD checkpoint and load their g values."""
+        if not self.csv_path.is_file() or self.csv_path.stat().st_size == 0:
+            with self.csv_path.open("w", newline="") as stream:
+                csv.DictWriter(
+                    stream,
+                    fieldnames=self.FIELDNAMES,
+                ).writeheader()
+            return
+
+        with self.csv_path.open("r", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != self.FIELDNAMES:
+                raise RuntimeError(
+                    f"Unexpected energy CSV header in {self.csv_path}: "
+                    f"{reader.fieldnames}"
+                )
+
+            kept_rows = []
+            for row in reader:
+                try:
+                    timestep = int(float(row["timestep"]))
+                    g_value = float(row["g_per_tlpp"])
+                except (TypeError, ValueError, KeyError):
+                    # Ignore a partially written final CSV row.
+                    continue
+
+                if timestep <= checkpoint_timestep:
+                    kept_rows.append(row)
+                    self.g_per_tlpp.append(g_value)
+                    self.last_recorded_timestep = max(
+                        self.last_recorded_timestep,
+                        timestep,
+                    )
+
+        # Rewrite atomically so energy rows later than the usable GSD
+        # checkpoint cannot be duplicated after continuation.
+        temporary_path = self.csv_path.with_suffix(".csv.tmp")
+        with temporary_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=self.FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(kept_rows)
+        os.replace(temporary_path, self.csv_path)
+
+        print(
+            f"ENERGY RESUME: kept {len(kept_rows)} rows through timestep "
+            f"{checkpoint_timestep} in {self.csv_path}",
+            flush=True,
+        )
 
     def act(self, timestep):
+        timestep = int(timestep)
+        if timestep <= self.last_recorded_timestep:
+            return
+
         scaled_pair = float(self.table.energy)
         scaled_tether = float(self.tether.energy)
         U_real = scaled_pair / self.s_value
@@ -503,18 +678,22 @@ class EnergyRecorder(hoomd.custom.Action):
         g_total = U_real - lambda_max_U_E
         g_per_tlpp = g_total / self.n_cores
         self.g_per_tlpp.append(g_per_tlpp)
+        self.last_recorded_timestep = timestep
 
         with self.csv_path.open("a", newline="") as stream:
-            csv.writer(stream).writerow(
-                [
-                    int(timestep),
-                    scaled_pair,
-                    scaled_tether,
-                    U_real,
-                    lambda_max_U_E,
-                    g_total,
-                    g_per_tlpp,
-                ]
+            csv.DictWriter(
+                stream,
+                fieldnames=self.FIELDNAMES,
+            ).writerow(
+                {
+                    "timestep": timestep,
+                    "scaled_pair_energy": scaled_pair,
+                    "scaled_tether_energy": scaled_tether,
+                    "U_real": U_real,
+                    "lambda_max_U_E": lambda_max_U_E,
+                    "g_total": g_total,
+                    "g_per_tlpp": g_per_tlpp,
+                }
             )
 
 
@@ -527,7 +706,7 @@ def set_table_pair(table, pair, r_min, r_cut, U, F):
 
 
 def s_label(s_value):
-    return f"{float(s_value):.6f}"
+    return f"{float(s_value):.16f}"
 
 
 def read_parameter_row(csv_path, row_index):
@@ -581,23 +760,108 @@ def state_output_dir(parameters, n_cores):
     rl = parameters["rl"]
     lambda_max = parameters["lambda_max"]
     return OUT_DIR / (
-        f"{crystal}_sz_{sz:.3f}_cr_{cr:.3f}_rl_{rl:.3f}_"
-        f"phi_{PHI:.3f}_sigmap_{SIGMAP:.3f}_lambda_{lambda_max:.8g}_N_{n_cores}"
+        f"{crystal}_sz_{sz:.2f}_cr_{cr:.1f}_rl_{rl:.1f}_"
+        f"phi_{PHI:.3f}_sigmap_{SIGMAP:.3f}_lambda_{lambda_max}_N_{n_cores}_"
+        f"{POTENTIAL_VERSION}"
     )
 
 
-def completed_summary(run_dir):
-    """Return the newest valid completed summary, if one exists."""
-    summaries = sorted(Path(run_dir).glob("attempt_*/summary.json"), reverse=True)
-    for summary_path in summaries:
-        try:
-            with summary_path.open("r") as stream:
-                summary = json.load(stream)
-        except (OSError, json.JSONDecodeError):
+def find_latest_usable_trajectory(run_dir):
+    """Return the readable trajectory that reaches the largest timestep.
+
+    This intentionally does not require summary.json or status="complete".
+    A Slurm timeout can terminate HOOMD after one or more GSD frames have been
+    committed but before the final summary is written. Those committed frames
+    are valid continuation checkpoints.
+    """
+    candidates = []
+
+    for attempt_dir in Path(run_dir).glob("attempt_*"):
+        if not attempt_dir.is_dir():
             continue
-        if summary.get("status") == "complete":
-            return summary_path, summary
-    return None, None
+
+        summary_path = attempt_dir / "summary.json"
+        summary = None
+
+        if summary_path.is_file():
+            try:
+                with summary_path.open("r") as stream:
+                    summary = json.load(stream)
+            except (OSError, json.JSONDecodeError):
+                # A missing, truncated, or invalid summary must not prevent
+                # recovery from a readable trajectory.
+                summary = None
+
+        trajectory_names = ["production.gsd", "restart.gsd"]
+        if summary is not None:
+            declared_name = summary.get("trajectory")
+            if declared_name:
+                trajectory_names.insert(0, declared_name)
+
+        seen_paths = set()
+        for trajectory_name in trajectory_names:
+            trajectory_path = attempt_dir / trajectory_name
+
+            if trajectory_path in seen_paths or not trajectory_path.is_file():
+                continue
+            seen_paths.add(trajectory_path)
+
+            try:
+                with gsd.hoomd.open(
+                    name=str(trajectory_path),
+                    mode="r",
+                ) as trajectory:
+                    number_of_frames = len(trajectory)
+                    if number_of_frames == 0:
+                        continue
+
+                    # Reading the final frame verifies that the last committed
+                    # frame is usable, not merely that the file exists.
+                    last_frame = trajectory[-1]
+                    last_timestep = int(last_frame.configuration.step)
+
+            except (OSError, RuntimeError, EOFError, ValueError) as error:
+                print(
+                    f"IGNORE UNREADABLE CHECKPOINT: {trajectory_path}: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+                continue
+
+            summary_status = (
+                summary.get("status", "unknown")
+                if summary is not None
+                else "missing"
+            )
+
+            candidates.append(
+                {
+                    "attempt_dir": attempt_dir,
+                    "summary_path": (
+                        summary_path if summary_path.is_file() else None
+                    ),
+                    "summary": summary,
+                    "summary_status": summary_status,
+                    "trajectory_path": trajectory_path,
+                    "number_of_frames": number_of_frames,
+                    "last_timestep": last_timestep,
+                    "last_frame": last_frame,
+                    "mtime": trajectory_path.stat().st_mtime,
+                }
+            )
+
+    if not candidates:
+        return None
+
+    # Prefer the checkpoint that reached the largest timestep. Modification
+    # time breaks a tie between duplicate attempts at the same timestep.
+    return max(
+        candidates,
+        key=lambda item: (
+            item["last_timestep"],
+            item["mtime"],
+        ),
+    )
 
 
 def atomic_write_json(path, data):
@@ -647,21 +911,66 @@ def run_window(parameters):
     run_dir = state_dir / f"s_{s_label(s_value)}" / f"seed_{int(seed)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    old_summary_path, old_summary = completed_summary(run_dir)
-    if old_summary is not None:
+    previous = find_latest_usable_trajectory(run_dir)
+    if previous is not None:
+        previous_timestep = previous["last_timestep"]
+        previous_frame_count = previous["number_of_frames"]
+        source_trajectory = previous["trajectory_path"]
+        source_summary_status = previous["summary_status"]
+
         print(
-            f"SKIP crystal={crystal} s={s_label(s_value)} seed={seed}: "
-            f"already complete -> {old_summary_path}"
+            f"FOUND CHECKPOINT crystal={crystal} "
+            f"s={s_label(s_value)} seed={seed}: "
+            f"{source_trajectory} has {previous_frame_count} frames; "
+            f"last timestep={previous_timestep}; "
+            f"summary status={source_summary_status}",
+            flush=True,
         )
-        return old_summary
 
-    attempt_name = datetime.now().strftime("attempt_%Y%m%d_%H%M%S_%f")
-    attempt_dir = run_dir / f"{attempt_name}_pid{os.getpid()}"
-    attempt_dir.mkdir(parents=False, exist_ok=False)
+        if previous_timestep >= TARGET_FINAL_TIMESTEP:
+            print(
+                f"SKIP: target timestep {TARGET_FINAL_TIMESTEP} has already "
+                f"been reached.",
+                flush=True,
+            )
+            if previous["summary"] is not None:
+                return previous["summary"]
+            return {
+                "status": "checkpoint_at_target_without_summary",
+                "trajectory": str(source_trajectory),
+                "final_timestep": int(previous_timestep),
+            }
 
-    trajectory_path = attempt_dir / "production.gsd"
-    energy_csv_path = attempt_dir / "energies.csv"
-    summary_path = attempt_dir / "summary.json"
+        starting_frame = previous["last_frame"]
+        is_continuation = True
+    else:
+        previous_timestep = 0
+        previous_frame_count = 0
+        source_trajectory = None
+        source_summary_status = None
+        starting_frame = None
+        is_continuation = False
+
+    if is_continuation:
+        # Continue inside the same attempt directory. This keeps exactly one
+        # production.gsd and one energies.csv for this run.
+        attempt_dir = previous["attempt_dir"]
+        trajectory_path = previous["trajectory_path"]
+        energy_csv_path = attempt_dir / "energies.csv"
+        summary_path = attempt_dir / "summary.json"
+
+        print(
+            f"APPENDING TO EXISTING ATTEMPT: {attempt_dir}",
+            flush=True,
+        )
+    else:
+        attempt_name = datetime.now().strftime("attempt_%Y%m%d_%H%M%S_%f")
+        attempt_dir = run_dir / f"{attempt_name}_pid{os.getpid()}"
+        attempt_dir.mkdir(parents=False, exist_ok=False)
+
+        trajectory_path = attempt_dir / "production.gsd"
+        energy_csv_path = attempt_dir / "energies.csv"
+        summary_path = attempt_dir / "summary.json"
 
     snapshot, body_positions, centers, orientations, box_lengths = (
         build_cores_snapshot(crystal, sz, cr, rl)
@@ -669,7 +978,10 @@ def run_window(parameters):
 
     device = hoomd.device.GPU() if USE_GPU else hoomd.device.CPU()
     simulation = hoomd.Simulation(device=device, seed=int(seed))
-    simulation.create_state_from_snapshot(snapshot)
+    if is_continuation:
+        simulation.create_state_from_snapshot(starting_frame)
+    else:
+        simulation.create_state_from_snapshot(snapshot)
 
     rigid = hoomd.md.constrain.Rigid()
     rigid.body["core"] = {
@@ -677,7 +989,10 @@ def run_window(parameters):
         "positions": body_positions.tolist(),
         "orientations": [(1.0, 0.0, 0.0, 0.0)] * 4,
     }
-    rigid.create_bodies(simulation.state)
+    # A saved production frame already contains the rigid constituents. Calling
+    # create_bodies() again would create four duplicate lobes per TLPP.
+    if not is_continuation:
+        rigid.create_bodies(simulation.state)
 
     n_cores = len(centers)
     expected_total = 5 * n_cores
@@ -693,12 +1008,32 @@ def run_window(parameters):
 
     core_radius = sz * rl
     lobe_radius = rl
-    rcc_min = 2.0 * core_radius
-    rcc_cut = rcc_min + 2.0 * L_BRUSH + SIGMAP
-    rcl_min = core_radius + lobe_radius
-    rcl_cut = rcl_min + 2.0 * L_BRUSH + SIGMAP
-    rll_min = 2.0 * lobe_radius
-    rll_cut = rll_min + 2.0 * L_BRUSH + SIGMAP
+    rcc_contact = 2.0 * core_radius
+    rcl_contact = core_radius + lobe_radius
+    rll_contact = 2.0 * lobe_radius
+
+    # Use the same small absolute center-to-center lower limit for all pair
+    # types. Avoid r=0, where the direction of the central force is undefined.
+    rcc_min = TABLE_R_MIN
+    rcl_min = TABLE_R_MIN
+    rll_min = TABLE_R_MIN
+
+    rcc_cut = rcc_contact + 2.0 * L_BRUSH + SIGMAP
+    rcl_cut = rcl_contact + 2.0 * L_BRUSH + SIGMAP
+    rll_cut = rll_contact + 2.0 * L_BRUSH + SIGMAP
+
+    n_table_cc = max(
+        2,
+        int(round((rcc_cut - rcc_min) / TABLE_TARGET_BIN_WIDTH)),
+    )
+    n_table_cl = max(
+        2,
+        int(round((rcl_cut - rcl_min) / TABLE_TARGET_BIN_WIDTH)),
+    )
+    n_table_ll = max(
+        2,
+        int(round((rll_cut - rll_min) / TABLE_TARGET_BIN_WIDTH)),
+    )
 
     U_cc_0, F_cc_0 = tabulate_P_implicit(
         core_radius,
@@ -709,7 +1044,7 @@ def run_window(parameters):
         RDEP,
         rcc_min,
         rcc_cut,
-        N_TABLE,
+        n_table_cc,
     )
     U_cl_0, F_cl_0 = tabulate_P_implicit(
         core_radius,
@@ -720,7 +1055,7 @@ def run_window(parameters):
         RDEP,
         rcl_min,
         rcl_cut,
-        N_TABLE,
+        n_table_cl,
     )
     U_ll_0, F_ll_0 = tabulate_P_implicit(
         lobe_radius,
@@ -731,8 +1066,41 @@ def run_window(parameters):
         RDEP,
         rll_min,
         rll_cut,
-        N_TABLE,
+        n_table_ll,
     )
+
+    # A concise startup diagnostic. For every pair type, the first table force
+    # and the force at contact must be finite and repulsive.
+    for pair_name, U_0, F_0, r_min, r_contact, r_cut, n_table in (
+        (
+            "core-core", U_cc_0, F_cc_0,
+            rcc_min, rcc_contact, rcc_cut, n_table_cc,
+        ),
+        (
+            "core-lobe", U_cl_0, F_cl_0,
+            rcl_min, rcl_contact, rcl_cut, n_table_cl,
+        ),
+        (
+            "lobe-lobe", U_ll_0, F_ll_0,
+            rll_min, rll_contact, rll_cut, n_table_ll,
+        ),
+    ):
+        table_spacing = (r_cut - r_min) / n_table
+        contact_index = int(round((r_contact - r_min) / table_spacing))
+        contact_index = min(max(contact_index, 0), len(U_0) - 1)
+
+        if F_0[0] <= 0.0 or F_0[contact_index] <= 0.0:
+            raise RuntimeError(
+                f"{pair_name} contact table is not repulsive: "
+                f"F(first)={F_0[0]}, F(contact)={F_0[contact_index]}."
+            )
+
+        print(
+            f"TABLE {pair_name}: n={n_table} "
+            f"dr={table_spacing:.8g} "
+            f"U(contact)={U_0[contact_index]:.8g} "
+            f"F(contact)={F_0[contact_index]:.8g}"
+        )
 
     # The pair force contributes s U_real to U_s.
     U_cc, F_cc = s_value * U_cc_0, s_value * F_cc_0
@@ -781,6 +1149,8 @@ def run_window(parameters):
         hoomd.md.methods.Langevin(filter=mobile_centers, kT=KT)
     )
     simulation.operations.integrator = integrator
+    # Preserve the continued positions and orientations, but draw valid thermal
+    # momenta because this GSD is a trajectory rather than an exact RNG checkpoint.
     simulation.state.thermalize_particle_momenta(filter=mobile_centers, kT=KT)
 
     thermo = hoomd.md.compute.ThermodynamicQuantities(filter=mobile_centers)
@@ -794,7 +1164,22 @@ def run_window(parameters):
     )
 
     start = time.perf_counter()
-    simulation.run(EQUIL_STEPS)
+    if not is_continuation:
+        simulation.run(EQUIL_STEPS)
+
+    current_timestep = int(simulation.timestep)
+    remaining_steps = TARGET_FINAL_TIMESTEP - current_timestep
+    if remaining_steps <= 0:
+        raise RuntimeError(
+            f"Current timestep {current_timestep} is already at or beyond "
+            f"target {TARGET_FINAL_TIMESTEP}."
+        )
+
+    print(
+        f"CONTINUATION={is_continuation} current timestep={current_timestep} "
+        f"target timestep={TARGET_FINAL_TIMESTEP} "
+        f"steps to run={remaining_steps}"
+    )
 
     logger = hoomd.logging.Logger()
     logger.add(simulation, quantities=["timestep", "tps"])
@@ -805,7 +1190,7 @@ def run_window(parameters):
     gsd_writer = hoomd.write.GSD(
         filename=str(trajectory_path),
         trigger=hoomd.trigger.Periodic(WRITE_EVERY),
-        mode="wb",
+        mode=("ab" if is_continuation else "wb"),
         logger=logger,
         dynamic=["property"],
     )
@@ -818,6 +1203,8 @@ def run_window(parameters):
         s_value=s_value,
         n_cores=n_cores,
         csv_path=energy_csv_path,
+        append=is_continuation,
+        checkpoint_timestep=(current_timestep if is_continuation else None),
     )
     recorder_writer = hoomd.write.CustomWriter(
         trigger=hoomd.trigger.Periodic(SAMPLE_EVERY),
@@ -825,7 +1212,7 @@ def run_window(parameters):
     )
     simulation.operations.writers.append(recorder_writer)
 
-    simulation.run(PRODUCTION_STEPS)
+    simulation.run(remaining_steps)
     elapsed = time.perf_counter() - start
 
     g_mean, g_block_sem, block_means = block_statistics(recorder.g_per_tlpp)
@@ -849,9 +1236,26 @@ def run_window(parameters):
         "rl": float(rl),
         "phi": float(PHI),
         "sigmap": float(SIGMAP),
+        "potential_version": POTENTIAL_VERSION,
+        "contact_switch_gap": float(CONTACT_SWITCH_GAP),
+        "contact_derivative_step": float(CONTACT_DERIVATIVE_STEP),
+        "table_r_min": float(TABLE_R_MIN),
+        "table_target_bin_width": float(TABLE_TARGET_BIN_WIDTH),
+        "number_of_table_points_core_core": int(n_table_cc),
+        "number_of_table_points_core_lobe": int(n_table_cl),
+        "number_of_table_points_lobe_lobe": int(n_table_ll),
         "dt": float(DT),
         "equil_steps": int(EQUIL_STEPS),
-        "production_steps": int(PRODUCTION_STEPS),
+        "production_steps": int(remaining_steps),
+        "target_final_timestep": int(TARGET_FINAL_TIMESTEP),
+        "starting_timestep": int(current_timestep),
+        "final_timestep": int(simulation.timestep),
+        "is_continuation": bool(is_continuation),
+        "source_trajectory": (
+            str(source_trajectory) if source_trajectory is not None else None
+        ),
+        "source_number_of_frames": int(previous_frame_count),
+        "source_summary_status": source_summary_status,
         "sample_every": int(SAMPLE_EVERY),
         "write_every": int(WRITE_EVERY),
         "fixed_reference_tlpp": bool(FIX_REFERENCE_TLPP),
