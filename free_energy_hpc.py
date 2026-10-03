@@ -56,11 +56,13 @@ DIAMOND_DIMS = (3, 4, 3)
 MTAB_DIMS = (3, 4, 3)
 RHOMBO_DIMS = (4, 4, 9)
 
-DT = 1e-5
-EQUIL_STEPS = 1000_000
-TARGET_FINAL_TIMESTEP = 500_000_000
-WRITE_EVERY = 100_000
-SAMPLE_EVERY = 100_000
+def sampling_settings(s_value):
+    """Select timestep and existing sampling schedule for this s window."""
+    if 0.00001 <= s_value <= 0.008:
+        return 5e-5, 200_000, 100_000_000, 20_000, 20_000
+    return 1e-4, 100_000, 50_000_000, 10_000, 10_000
+
+
 USE_GPU = False
 FIX_REFERENCE_TLPP = True
 
@@ -766,102 +768,76 @@ def state_output_dir(parameters, n_cores):
     )
 
 
-def find_latest_usable_trajectory(run_dir):
-    """Return the readable trajectory that reaches the largest timestep.
+def find_earliest_attempt_trajectory(run_dir):
+    """Read the checkpoint in the first-created attempt for one seed.
 
-    This intentionally does not require summary.json or status="complete".
-    A Slurm timeout can terminate HOOMD after one or more GSD frames have been
-    committed but before the final summary is written. Those committed frames
-    are valid continuation checkpoints.
+    Attempt directory names begin with an ISO-like timestamp, so sorting their
+    names selects the attempt created first.  We deliberately resume only that
+    attempt, keeping one production.gsd and one energies.csv for the run.
+
+    Progress is read from ``last_frame.configuration.step``.  It must not be
+    reconstructed from the frame count because equilibration and resumed jobs
+    can change the relationship between frame index and simulation timestep.
     """
-    candidates = []
+    attempt_dirs = sorted(
+        path
+        for path in Path(run_dir).glob("attempt_*")
+        if path.is_dir()
+    )
 
-    for attempt_dir in Path(run_dir).glob("attempt_*"):
-        if not attempt_dir.is_dir():
-            continue
-
-        summary_path = attempt_dir / "summary.json"
-        summary = None
-
-        if summary_path.is_file():
-            try:
-                with summary_path.open("r") as stream:
-                    summary = json.load(stream)
-            except (OSError, json.JSONDecodeError):
-                # A missing, truncated, or invalid summary must not prevent
-                # recovery from a readable trajectory.
-                summary = None
-
-        trajectory_names = ["production.gsd", "restart.gsd"]
-        if summary is not None:
-            declared_name = summary.get("trajectory")
-            if declared_name:
-                trajectory_names.insert(0, declared_name)
-
-        seen_paths = set()
-        for trajectory_name in trajectory_names:
-            trajectory_path = attempt_dir / trajectory_name
-
-            if trajectory_path in seen_paths or not trajectory_path.is_file():
-                continue
-            seen_paths.add(trajectory_path)
-
-            try:
-                with gsd.hoomd.open(
-                    name=str(trajectory_path),
-                    mode="r",
-                ) as trajectory:
-                    number_of_frames = len(trajectory)
-                    if number_of_frames == 0:
-                        continue
-
-                    # Reading the final frame verifies that the last committed
-                    # frame is usable, not merely that the file exists.
-                    last_frame = trajectory[-1]
-                    last_timestep = int(last_frame.configuration.step)
-
-            except (OSError, RuntimeError, EOFError, ValueError) as error:
-                print(
-                    f"IGNORE UNREADABLE CHECKPOINT: {trajectory_path}: "
-                    f"{type(error).__name__}: {error}",
-                    flush=True,
-                )
-                continue
-
-            summary_status = (
-                summary.get("status", "unknown")
-                if summary is not None
-                else "missing"
-            )
-
-            candidates.append(
-                {
-                    "attempt_dir": attempt_dir,
-                    "summary_path": (
-                        summary_path if summary_path.is_file() else None
-                    ),
-                    "summary": summary,
-                    "summary_status": summary_status,
-                    "trajectory_path": trajectory_path,
-                    "number_of_frames": number_of_frames,
-                    "last_timestep": last_timestep,
-                    "last_frame": last_frame,
-                    "mtime": trajectory_path.stat().st_mtime,
-                }
-            )
-
-    if not candidates:
+    if not attempt_dirs:
         return None
 
-    # Prefer the checkpoint that reached the largest timestep. Modification
-    # time breaks a tie between duplicate attempts at the same timestep.
-    return max(
-        candidates,
-        key=lambda item: (
-            item["last_timestep"],
-            item["mtime"],
-        ),
+    attempt_dir = attempt_dirs[0]
+    trajectory_path = attempt_dir / "production.gsd"
+    summary_path = attempt_dir / "summary.json"
+
+    if not trajectory_path.is_file():
+        raise RuntimeError(
+            f"The earliest attempt has no production.gsd: {attempt_dir}"
+        )
+
+    try:
+        with gsd.hoomd.open(name=str(trajectory_path), mode="r") as trajectory:
+            number_of_frames = len(trajectory)
+            if number_of_frames == 0:
+                raise RuntimeError(
+                    f"The earliest attempt contains an empty production.gsd: "
+                    f"{trajectory_path}"
+                )
+
+            last_frame_index = number_of_frames - 1
+            last_timestep = int(
+                trajectory[last_frame_index].configuration.step
+            )
+    except (OSError, EOFError, RuntimeError, ValueError) as error:
+        raise RuntimeError(
+            f"Cannot read the earliest attempt checkpoint {trajectory_path}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+
+    summary = None
+    if summary_path.is_file():
+        try:
+            with summary_path.open("r") as stream:
+                summary = json.load(stream)
+        except (OSError, json.JSONDecodeError):
+            summary = None
+
+    summary_status = (
+        summary.get("status", "unknown") if summary is not None else "missing"
     )
+
+    return {
+        "attempt_dir": attempt_dir,
+        "summary_path": summary_path if summary_path.is_file() else None,
+        "summary": summary,
+        "summary_status": summary_status,
+        "trajectory_path": trajectory_path,
+        "number_of_frames": number_of_frames,
+        "last_frame_index": last_frame_index,
+        "last_timestep": last_timestep,
+    }
 
 
 def atomic_write_json(path, data):
@@ -903,6 +879,15 @@ def run_window(parameters):
     cr = parameters["cr"]
     rl = parameters["rl"]
     s_value = parameters["s"]
+    DT, EQUIL_STEPS, TARGET_FINAL_TIMESTEP, WRITE_EVERY, SAMPLE_EVERY = (
+        sampling_settings(s_value)
+    )
+    print(
+        f"s={s_value:g}, DT={DT:g}, equil={EQUIL_STEPS}, "
+        f"target={TARGET_FINAL_TIMESTEP}, "
+        f"write every={WRITE_EVERY}, sample every={SAMPLE_EVERY}",
+        flush=True,
+    )
     seed = parameters["seed"]
     lambda_max = parameters["lambda_max"]
 
@@ -911,7 +896,7 @@ def run_window(parameters):
     run_dir = state_dir / f"s_{s_label(s_value)}" / f"seed_{int(seed)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    previous = find_latest_usable_trajectory(run_dir)
+    previous = find_earliest_attempt_trajectory(run_dir)
     if previous is not None:
         previous_timestep = previous["last_timestep"]
         previous_frame_count = previous["number_of_frames"]
@@ -922,6 +907,7 @@ def run_window(parameters):
             f"FOUND CHECKPOINT crystal={crystal} "
             f"s={s_label(s_value)} seed={seed}: "
             f"{source_trajectory} has {previous_frame_count} frames; "
+            f"last frame index={previous['last_frame_index']}; "
             f"last timestep={previous_timestep}; "
             f"summary status={source_summary_status}",
             flush=True,
@@ -941,14 +927,12 @@ def run_window(parameters):
                 "final_timestep": int(previous_timestep),
             }
 
-        starting_frame = previous["last_frame"]
         is_continuation = True
     else:
         previous_timestep = 0
         previous_frame_count = 0
         source_trajectory = None
         source_summary_status = None
-        starting_frame = None
         is_continuation = False
 
     if is_continuation:
@@ -979,7 +963,20 @@ def run_window(parameters):
     device = hoomd.device.GPU() if USE_GPU else hoomd.device.CPU()
     simulation = hoomd.Simulation(device=device, seed=int(seed))
     if is_continuation:
-        simulation.create_state_from_snapshot(starting_frame)
+        # create_state_from_snapshot(gsd_frame) resets the HOOMD timestep to
+        # zero. Loading the file directly preserves the timestep stored in the
+        # selected GSD frame.
+        simulation.create_state_from_gsd(
+            filename=str(source_trajectory),
+            frame=-1,
+        )
+        restored_timestep = int(simulation.timestep)
+        if restored_timestep != previous_timestep:
+            raise RuntimeError(
+                "Checkpoint timestep was not restored exactly: "
+                f"GSD last timestep={previous_timestep}, "
+                f"simulation timestep={restored_timestep}."
+            )
     else:
         simulation.create_state_from_snapshot(snapshot)
 
